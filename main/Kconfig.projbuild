@@ -1,0 +1,23 @@
+menu "Application Role Configuration"
+
+    choice APP_ROLE
+        prompt "Device Operating Role"
+        default APP_ROLE_PING_PONG
+        help
+            Select the operational role for this firmware build.
+            - Node TX: Periodic telemetry transmitter
+            - Gateway RX: Continuous packet receiver and logger
+            - Ping-Pong: Two-board bidirectional link test
+
+        config APP_ROLE_NODE_TX
+            bool "Node TX (Transmitter)"
+
+        config APP_ROLE_GATEWAY_RX
+            bool "Gateway RX (Receiver)"
+
+        config APP_ROLE_PING_PONG
+            bool "Ping-Pong (Bidirectional P2P Test)"
+
+    endchoice
+
+endmenu
