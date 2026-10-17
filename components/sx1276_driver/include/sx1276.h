@@ -2,7 +2,10 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include <stddef.h>
 #include "esp_err.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -45,6 +48,15 @@ typedef enum {
     SX1276_PA_PIN_RFO = 0,      /**< RFO pin, max +14 dBm */
     SX1276_PA_PIN_BOOST = 1,    /**< PA_BOOST pin, max +17 dBm (or +20 dBm with PA_DAC) */
 } sx1276_pa_pin_t;
+
+/**
+ * @brief SX1276 DIO0 pin mapping in LoRa mode (RegDioMapping1 bits [7:6]).
+ */
+typedef enum {
+    SX1276_DIO0_MAP_RX_DONE = 0,    /**< 00b: DIO0 mapped to RxDone */
+    SX1276_DIO0_MAP_TX_DONE = 1,    /**< 01b: DIO0 mapped to TxDone */
+    SX1276_DIO0_MAP_CAD_DONE = 2,   /**< 10b: DIO0 mapped to CadDone */
+} sx1276_dio0_mapping_t;
 
 /**
  * @brief LoRa signal bandwidth enum (RegModemConfig1 bits [7:4]).
@@ -569,6 +581,112 @@ esp_err_t sx1276_start_rx_continuous(void);
  *      - Other esp_err_t codes from SPI communication
  */
 esp_err_t sx1276_poll_rx_packet(uint8_t *out_payload, size_t capacity, size_t *out_length, sx1276_rx_metrics_t *out_metrics, uint32_t timeout_ms);
+
+/* --- Phase 4 DIO0 Interrupt and Event-Driven Radio APIs --- */
+
+/**
+ * @brief Configure SX1276 DIO0 pin mapping in RegDioMapping1 (0x40).
+ *
+ * Performs read-modify-write on RegDioMapping1 to configure DIO0 bits [7:6]
+ * while preserving DIO1..DIO3. Verifies the written mapping via read-back.
+ *
+ * @note Context: Task context only. Device must be initialized.
+ *
+ * @param[in] mapping Mapping value from sx1276_dio0_mapping_t (e.g. SX1276_DIO0_MAP_RX_DONE).
+ *
+ * @return
+ *      - ESP_OK: Mapping written and verified successfully
+ *      - ESP_ERR_INVALID_ARG: Invalid mapping argument
+ *      - ESP_ERR_INVALID_STATE: Driver not initialized
+ *      - ESP_ERR_INVALID_RESPONSE: Read-back verification failed
+ *      - Other esp_err_t codes from SPI communication
+ */
+esp_err_t sx1276_configure_dio0_mapping(sx1276_dio0_mapping_t mapping);
+
+/**
+ * @brief Initialize BOARD_LORA_DIO0 GPIO interrupt and register ISR handler.
+ *
+ * Configures BOARD_LORA_DIO0 as input with rising-edge interrupt (GPIO_INTR_POSEDGE).
+ * Installs GPIO ISR service (if not already installed) and attaches an ISR handler
+ * that wakes the specified FreeRTOS task via vTaskNotifyGiveFromISR() and portYIELD_FROM_ISR().
+ *
+ * @note Context: Task context only. Task handle must be non-NULL (RTOS-009).
+ *
+ * @param[in] task_to_notify FreeRTOS TaskHandle_t to notify upon DIO0 rising edge. Must not be NULL.
+ *
+ * @return
+ *      - ESP_OK: ISR initialized and handler registered successfully
+ *      - ESP_ERR_INVALID_ARG: task_to_notify is NULL
+ *      - Other esp_err_t codes from gpio_config, gpio_install_isr_service, or gpio_isr_handler_add
+ */
+esp_err_t sx1276_init_dio0_isr(TaskHandle_t task_to_notify);
+
+/**
+ * @brief Remove DIO0 GPIO ISR handler and disable interrupt on BOARD_LORA_DIO0.
+ *
+ * Detaches the ISR handler and disables interrupts on BOARD_LORA_DIO0.
+ *
+ * @note Context: Task context only.
+ *
+ * @return
+ *      - ESP_OK: Handler removed and interrupt disabled successfully
+ *      - Other esp_err_t codes from gpio_isr_handler_remove or gpio_intr_disable
+ */
+esp_err_t sx1276_deinit_dio0_isr(void);
+
+/**
+ * @brief Process radio hardware event following DIO0 notification or polling.
+ *
+ * Reads RegIrqFlags (0x12), checks for PayloadCrcError and RxDone:
+ * - If PayloadCrcError: clears IRQ flags and returns ESP_ERR_INVALID_CRC.
+ * - If RxDone: reads packet length from RegRxNbBytes, checks capacity, sets FIFO pointer,
+ *   reads payload from FIFO, reads RSSI/SNR metrics, clears RxDone, and returns ESP_OK.
+ * - If neither: clears any spurious flags and returns ESP_ERR_NOT_FOUND.
+ *
+ * @note Context: Radio owner task context only.
+ *
+ * @param[out] out_payload Buffer to receive packet payload. Must not be NULL.
+ * @param[in] capacity Maximum capacity of out_payload buffer in bytes.
+ * @param[out] out_length Pointer to receive actual number of bytes read. Must not be NULL.
+ * @param[out] out_metrics Pointer to receive packet signal metrics (can be NULL if not needed).
+ *
+ * @return
+ *      - ESP_OK: Packet received and processed successfully
+ *      - ESP_ERR_INVALID_ARG: out_payload or out_length is NULL, or capacity is 0
+ *      - ESP_ERR_INVALID_STATE: Driver not initialized
+ *      - ESP_ERR_INVALID_CRC: Packet received but PayloadCrcError was asserted
+ *      - ESP_ERR_INVALID_SIZE: Packet length exceeds buffer capacity
+ *      - ESP_ERR_NOT_FOUND: No packet completion event found in IRQ flags
+ *      - Other esp_err_t codes from SPI communication
+ */
+esp_err_t sx1276_handle_radio_event(uint8_t *out_payload, size_t capacity, size_t *out_length, sx1276_rx_metrics_t *out_metrics);
+
+/**
+ * @brief Wait for an incoming packet via DIO0 interrupt and read payload from FIFO.
+ *
+ * Blocks the calling task using ulTaskNotifyTake() with the specified timeout.
+ * When awakened by DIO0 ISR (or upon timeout with late-arriving event):
+ * delegates to sx1276_handle_radio_event() to validate and extract the packet.
+ * If DIO0 ISR is not initialized, falls back to sx1276_poll_rx_packet().
+ *
+ * @note Context: Radio owner task context only. Device must be in RX_CONTINUOUS mode.
+ *
+ * @param[out] out_payload Buffer to receive packet payload. Must not be NULL.
+ * @param[in] capacity Maximum capacity of out_payload buffer in bytes.
+ * @param[out] out_length Pointer to receive actual number of bytes read. Must not be NULL.
+ * @param[out] out_metrics Pointer to receive packet signal metrics (can be NULL if not needed).
+ * @param[in] timeout_ms Maximum time to wait for a packet in milliseconds.
+ *
+ * @return
+ *      - ESP_OK: Packet received and validated successfully
+ *      - ESP_ERR_INVALID_ARG: out_payload or out_length is NULL, or capacity is 0
+ *      - ESP_ERR_INVALID_STATE: Driver not initialized
+ *      - ESP_ERR_TIMEOUT: Timeout expired with no packet received
+ *      - ESP_ERR_INVALID_CRC: Packet received but PayloadCrcError was asserted
+ *      - ESP_ERR_INVALID_SIZE: Packet length exceeds buffer capacity
+ *      - Other esp_err_t codes from SPI communication
+ */
+esp_err_t sx1276_receive_packet(uint8_t *out_payload, size_t capacity, size_t *out_length, sx1276_rx_metrics_t *out_metrics, uint32_t timeout_ms);
 
 #ifdef __cplusplus
 }

@@ -24,9 +24,28 @@ static const char *s_tag = "sx1276";
 static spi_device_handle_t s_spi_handle = NULL;
 static bool s_is_initialized = false;
 static sx1276_state_t s_current_state = SX1276_STATE_UNINIT;
+static TaskHandle_t s_dio0_notify_task = NULL;
 
 static DMA_ATTR uint8_t s_fifo_tx_buf[SX1276_FIFO_MAX_TRANSFER_SIZE];
 static DMA_ATTR uint8_t s_fifo_rx_buf[SX1276_FIFO_MAX_TRANSFER_SIZE];
+
+/**
+ * @brief Minimal DIO0 GPIO ISR handler (RTOS-003, RTOS-004).
+ *
+ * Runs in interrupt context on rising edge of BOARD_LORA_DIO0.
+ * Unblocks the registered Radio Owner Task via vTaskNotifyGiveFromISR().
+ *
+ * @param[in] arg Pointer to registered FreeRTOS TaskHandle_t.
+ */
+static void IRAM_ATTR sx1276_handle_dio0_intr(void *arg)
+{
+    TaskHandle_t task_to_notify = (TaskHandle_t)arg;
+    if (task_to_notify != NULL) {
+        BaseType_t higher_priority_task_woken = pdFALSE;
+        vTaskNotifyGiveFromISR(task_to_notify, &higher_priority_task_woken);
+        portYIELD_FROM_ISR(higher_priority_task_woken);
+    }
+}
 
 /**
  * @brief Internal helper to write RegOpMode and wait for status with bounded retries.
@@ -220,6 +239,10 @@ esp_err_t sx1276_deinit_device(void)
     if (ret != ESP_OK) {
         ESP_LOGE(s_tag, "Failed to remove SPI device (err: %s)", esp_err_to_name(ret));
         return ret;
+    }
+
+    if (s_dio0_notify_task != NULL) {
+        (void)sx1276_deinit_dio0_isr();
     }
 
     s_spi_handle = NULL;
@@ -859,6 +882,107 @@ esp_err_t sx1276_read_packet_metrics(sx1276_rx_metrics_t *out_metrics)
     return ESP_OK;
 }
 
+esp_err_t sx1276_configure_dio0_mapping(sx1276_dio0_mapping_t mapping)
+{
+    if ((uint8_t)mapping > (uint8_t)SX1276_DIO0_MAP_CAD_DONE) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (!s_is_initialized || s_spi_handle == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    uint8_t current_mapping = 0U;
+    esp_err_t ret = sx1276_read_register(SX1276_REG_DIO_MAPPING_1, &current_mapping);
+    if (ret != ESP_OK) {
+        ESP_LOGE(s_tag, "Failed to read RegDioMapping1 (err: %s)", esp_err_to_name(ret));
+        return ret;
+    }
+
+    /* Preserve DIO1..DIO3, update DIO0 mapping bits [7:6] */
+    const uint8_t new_mapping = (uint8_t)((current_mapping & (uint8_t)~SX1276_DIO0_MAPPING_MASK) |
+                                          (((uint8_t)mapping << SX1276_DIO0_MAPPING_SHIFT) & SX1276_DIO0_MAPPING_MASK));
+
+    ret = sx1276_write_register(SX1276_REG_DIO_MAPPING_1, new_mapping);
+    if (ret != ESP_OK) {
+        ESP_LOGE(s_tag, "Failed to write RegDioMapping1 (err: %s)", esp_err_to_name(ret));
+        return ret;
+    }
+
+    /* Read back and verify */
+    uint8_t verify_mapping = 0U;
+    ret = sx1276_read_register(SX1276_REG_DIO_MAPPING_1, &verify_mapping);
+    if (ret != ESP_OK) {
+        ESP_LOGE(s_tag, "Failed to verify RegDioMapping1 (err: %s)", esp_err_to_name(ret));
+        return ret;
+    }
+
+    if ((verify_mapping & SX1276_DIO0_MAPPING_MASK) !=
+        (((uint8_t)mapping << SX1276_DIO0_MAPPING_SHIFT) & SX1276_DIO0_MAPPING_MASK)) {
+        ESP_LOGE(s_tag, "RegDioMapping1 verify mismatch: expected 0x%02X, actual 0x%02X",
+                 new_mapping, verify_mapping);
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+
+    return ESP_OK;
+}
+
+esp_err_t sx1276_init_dio0_isr(TaskHandle_t task_to_notify)
+{
+    if (task_to_notify == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    s_dio0_notify_task = task_to_notify;
+
+    const gpio_config_t dio0_conf = {
+        .pin_bit_mask = (1ULL << BOARD_LORA_DIO0),
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_ENABLE,
+        .intr_type = GPIO_INTR_POSEDGE,
+    };
+
+    esp_err_t ret = gpio_config(&dio0_conf);
+    if (ret != ESP_OK) {
+        ESP_LOGE(s_tag, "Failed to configure DIO0 GPIO (err: %s)", esp_err_to_name(ret));
+        s_dio0_notify_task = NULL;
+        return ret;
+    }
+
+    ret = gpio_install_isr_service(0);
+    if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
+        ESP_LOGE(s_tag, "Failed to install GPIO ISR service (err: %s)", esp_err_to_name(ret));
+        s_dio0_notify_task = NULL;
+        return ret;
+    }
+
+    ret = gpio_isr_handler_add(BOARD_LORA_DIO0, sx1276_handle_dio0_intr, (void *)task_to_notify);
+    if (ret != ESP_OK) {
+        ESP_LOGE(s_tag, "Failed to add DIO0 ISR handler (err: %s)", esp_err_to_name(ret));
+        s_dio0_notify_task = NULL;
+        return ret;
+    }
+
+    ESP_LOGI(s_tag, "DIO0 ISR initialized on GPIO%d (rising edge) for task %p",
+             BOARD_LORA_DIO0, (void *)task_to_notify);
+    return ESP_OK;
+}
+
+esp_err_t sx1276_deinit_dio0_isr(void)
+{
+    esp_err_t ret = gpio_isr_handler_remove(BOARD_LORA_DIO0);
+    if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
+        ESP_LOGW(s_tag, "Failed to remove DIO0 ISR handler (err: %s)", esp_err_to_name(ret));
+    }
+
+    (void)gpio_intr_disable(BOARD_LORA_DIO0);
+    s_dio0_notify_task = NULL;
+
+    ESP_LOGI(s_tag, "DIO0 ISR deinitialized");
+    return ESP_OK;
+}
+
 esp_err_t sx1276_send_packet(const uint8_t *payload, size_t length, uint32_t timeout_ms)
 {
     if (payload == NULL || length == 0U || length > 255U) {
@@ -876,78 +1000,100 @@ esp_err_t sx1276_send_packet(const uint8_t *payload, size_t length, uint32_t tim
         return ret;
     }
 
-    /* Step 2: Clear stale IRQ flags */
+    /* Step 2: Configure DIO0 mapping to TxDone */
+    ret = sx1276_configure_dio0_mapping(SX1276_DIO0_MAP_TX_DONE);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    /* Step 3: Clear stale IRQ flags */
     ret = sx1276_clear_all_irq_flags();
     if (ret != ESP_OK) {
         return ret;
     }
 
-    /* Step 3: Read FIFO TX base address (RAD-008) */
+    /* Step 4: Read FIFO TX base address (RAD-008) */
     uint8_t tx_base = 0U;
     ret = sx1276_read_register(SX1276_REG_FIFO_TX_BASE_ADDR, &tx_base);
     if (ret != ESP_OK) {
         return ret;
     }
 
-    /* Step 4: Set FIFO address pointer to TX base address */
+    /* Step 5: Set FIFO address pointer to TX base address */
     ret = sx1276_write_register(SX1276_REG_FIFO_ADDR_PTR, tx_base);
     if (ret != ESP_OK) {
         return ret;
     }
 
-    /* Step 5: Write payload into FIFO */
+    /* Step 6: Write payload into FIFO */
     ret = sx1276_write_fifo(payload, length);
     if (ret != ESP_OK) {
         return ret;
     }
 
-    /* Step 6: Write payload length */
+    /* Step 7: Write payload length */
     ret = sx1276_write_register(SX1276_REG_PAYLOAD_LENGTH, (uint8_t)length);
     if (ret != ESP_OK) {
         return ret;
     }
 
-    /* Step 7: Switch to TX mode (RegOpMode = 0x83) */
+    /* Step 8: Clear any pending notifications prior to entering TX */
+    (void)ulTaskNotifyTake(pdTRUE, 0);
+
+    /* Step 9: Switch to TX mode (RegOpMode = 0x83) */
     ret = sx1276_set_lora_tx_mode();
     if (ret != ESP_OK) {
         return ret;
     }
 
-    /* Step 8: Poll RegIrqFlags with bounded timeout (ERR-005, RTOS-007) */
-    const uint32_t poll_interval_ms = SX1276_POLL_INTERVAL_MS;
-    const uint32_t max_iterations = (timeout_ms + poll_interval_ms - 1U) / poll_interval_ms;
+    /* Step 10: Wait for TxDone via Task Notification (Event-Driven) or polling fallback */
     bool tx_done = false;
-
-    for (uint32_t iter = 0U; iter < max_iterations; iter++) {
-        vTaskDelay(pdMS_TO_TICKS(poll_interval_ms) + 1);
-
+    if (s_dio0_notify_task != NULL) {
+        uint32_t notified = ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(timeout_ms));
         uint8_t irq_flags = 0U;
         ret = sx1276_read_irq_flags(&irq_flags);
-        if (ret != ESP_OK) {
-            ESP_LOGE(s_tag, "Failed to read IRQ flags during TX poll (err: %s)", esp_err_to_name(ret));
-            (void)sx1276_set_lora_standby_mode();
-            return ret;
-        }
-
-        if ((irq_flags & SX1276_IRQ_TX_DONE_MASK) != 0U) {
+        if (ret == ESP_OK && ((irq_flags & SX1276_IRQ_TX_DONE_MASK) != 0U)) {
             tx_done = true;
-            break;
+        } else if (notified == 0U) {
+            /* Timeout: Single IRQ check above distinguishes missed event from real timeout */
+            ESP_LOGE(s_tag, "TX timeout (%" PRIu32 " ms expired without TxDone, irq_flags: 0x%02X)",
+                     timeout_ms, irq_flags);
+        }
+    } else {
+        /* Fallback polling for regression verification (Phase 3) */
+        const uint32_t poll_interval_ms = SX1276_POLL_INTERVAL_MS;
+        const uint32_t max_iterations = (timeout_ms + poll_interval_ms - 1U) / poll_interval_ms;
+
+        for (uint32_t iter = 0U; iter < max_iterations; iter++) {
+            vTaskDelay(pdMS_TO_TICKS(poll_interval_ms) + 1);
+
+            uint8_t irq_flags = 0U;
+            ret = sx1276_read_irq_flags(&irq_flags);
+            if (ret != ESP_OK) {
+                ESP_LOGE(s_tag, "Failed to read IRQ flags during TX poll (err: %s)", esp_err_to_name(ret));
+                (void)sx1276_set_lora_standby_mode();
+                return ret;
+            }
+
+            if ((irq_flags & SX1276_IRQ_TX_DONE_MASK) != 0U) {
+                tx_done = true;
+                break;
+            }
         }
     }
 
     if (!tx_done) {
-        ESP_LOGE(s_tag, "TX timeout (%" PRIu32 " ms expired without TxDone)", timeout_ms);
         (void)sx1276_set_lora_standby_mode();
         return ESP_ERR_TIMEOUT;
     }
 
-    /* Step 9: Clear TxDone flag (write-1-to-clear) */
+    /* Step 11: Clear TxDone flag (write-1-to-clear) */
     ret = sx1276_clear_irq_flags(SX1276_IRQ_TX_DONE_MASK);
     if (ret != ESP_OK) {
         return ret;
     }
 
-    /* Step 10: Switch radio back to Standby */
+    /* Step 12: Switch radio back to Standby */
     ret = sx1276_set_lora_standby_mode();
     if (ret != ESP_OK) {
         return ret;
@@ -968,31 +1114,158 @@ esp_err_t sx1276_start_rx_continuous(void)
         return ret;
     }
 
-    /* Step 2: Configure RX FIFO base address to 0x00 */
+    /* Step 2: Configure DIO0 mapping to RxDone */
+    ret = sx1276_configure_dio0_mapping(SX1276_DIO0_MAP_RX_DONE);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    /* Step 3: Configure RX FIFO base address to 0x00 */
     ret = sx1276_write_register(SX1276_REG_FIFO_RX_BASE_ADDR, 0x00U);
     if (ret != ESP_OK) {
         return ret;
     }
 
-    /* Step 3: Set FIFO address pointer to base address */
+    /* Step 4: Set FIFO address pointer to base address */
     ret = sx1276_write_register(SX1276_REG_FIFO_ADDR_PTR, 0x00U);
     if (ret != ESP_OK) {
         return ret;
     }
 
-    /* Step 4: Clear all previous IRQ flags */
+    /* Step 5: Clear all previous IRQ flags */
     ret = sx1276_clear_all_irq_flags();
     if (ret != ESP_OK) {
         return ret;
     }
 
-    /* Step 5: Enter RX_CONTINUOUS mode */
+    /* Step 6: Clear any pending notifications prior to entering RX */
+    (void)ulTaskNotifyTake(pdTRUE, 0);
+
+    /* Step 7: Enter RX_CONTINUOUS mode */
     ret = sx1276_set_lora_rx_continuous_mode();
     if (ret != ESP_OK) {
         return ret;
     }
 
     return ESP_OK;
+}
+
+esp_err_t sx1276_handle_radio_event(uint8_t *out_payload, size_t capacity, size_t *out_length, sx1276_rx_metrics_t *out_metrics)
+{
+    if (out_payload == NULL || out_length == NULL || capacity == 0U) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (!s_is_initialized || s_spi_handle == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    uint8_t irq_flags = 0U;
+    esp_err_t ret = sx1276_read_irq_flags(&irq_flags);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    /* Check PayloadCrcError (RAD-007) */
+    if ((irq_flags & SX1276_IRQ_PAYLOAD_CRC_ERROR_MASK) != 0U) {
+        (void)sx1276_clear_irq_flags(SX1276_IRQ_RX_DONE_MASK | SX1276_IRQ_PAYLOAD_CRC_ERROR_MASK);
+        return ESP_ERR_INVALID_CRC;
+    }
+
+    if ((irq_flags & SX1276_IRQ_RX_DONE_MASK) != 0U) {
+        /* Read number of bytes received */
+        uint8_t nb_bytes = 0U;
+        ret = sx1276_read_register(SX1276_REG_RX_NB_BYTES, &nb_bytes);
+        if (ret != ESP_OK) {
+            (void)sx1276_clear_irq_flags(SX1276_IRQ_RX_DONE_MASK);
+            return ret;
+        }
+
+        if ((size_t)nb_bytes > capacity) {
+            ESP_LOGE(s_tag, "RX packet size (%u) exceeds buffer capacity (%zu)", nb_bytes, capacity);
+            (void)sx1276_clear_irq_flags(SX1276_IRQ_RX_DONE_MASK);
+            return ESP_ERR_INVALID_SIZE;
+        }
+
+        /* Read start address of last packet received */
+        uint8_t rx_current_addr = 0U;
+        ret = sx1276_read_register(SX1276_REG_FIFO_RX_CURRENT_ADDR, &rx_current_addr);
+        if (ret != ESP_OK) {
+            (void)sx1276_clear_irq_flags(SX1276_IRQ_RX_DONE_MASK);
+            return ret;
+        }
+
+        /* Set FIFO address pointer to start of received packet */
+        ret = sx1276_write_register(SX1276_REG_FIFO_ADDR_PTR, rx_current_addr);
+        if (ret != ESP_OK) {
+            (void)sx1276_clear_irq_flags(SX1276_IRQ_RX_DONE_MASK);
+            return ret;
+        }
+
+        /* Read payload bytes from FIFO */
+        if (nb_bytes > 0U) {
+            ret = sx1276_read_fifo(out_payload, (size_t)nb_bytes, capacity);
+            if (ret != ESP_OK) {
+                (void)sx1276_clear_irq_flags(SX1276_IRQ_RX_DONE_MASK);
+                return ret;
+            }
+        }
+
+        *out_length = (size_t)nb_bytes;
+
+        /* Read RSSI and SNR metrics */
+        if (out_metrics != NULL) {
+            ret = sx1276_read_packet_metrics(out_metrics);
+            if (ret != ESP_OK) {
+                ESP_LOGW(s_tag, "Failed to read packet metrics (err: %s)", esp_err_to_name(ret));
+            }
+        }
+
+        /* Clear RxDone flag (write-1-to-clear) */
+        ret = sx1276_clear_irq_flags(SX1276_IRQ_RX_DONE_MASK);
+        if (ret != ESP_OK) {
+            return ret;
+        }
+
+        return ESP_OK;
+    }
+
+    if (irq_flags != 0U) {
+        (void)sx1276_clear_irq_flags(irq_flags);
+    }
+
+    return ESP_ERR_NOT_FOUND;
+}
+
+esp_err_t sx1276_receive_packet(uint8_t *out_payload, size_t capacity, size_t *out_length, sx1276_rx_metrics_t *out_metrics, uint32_t timeout_ms)
+{
+    if (out_payload == NULL || out_length == NULL || capacity == 0U) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (!s_is_initialized || s_spi_handle == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    uint32_t notified = 0U;
+    if (s_dio0_notify_task != NULL) {
+        notified = ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(timeout_ms));
+    } else {
+        /* Fallback polling if ISR is not registered */
+        return sx1276_poll_rx_packet(out_payload, capacity, out_length, out_metrics, timeout_ms);
+    }
+
+    if (notified == 0U) {
+        /* Single IRQ read to distinguish missed event from real timeout */
+        uint8_t irq_flags = 0U;
+        esp_err_t ret = sx1276_read_irq_flags(&irq_flags);
+        if (ret == ESP_OK && ((irq_flags & (SX1276_IRQ_RX_DONE_MASK | SX1276_IRQ_PAYLOAD_CRC_ERROR_MASK)) != 0U)) {
+            return sx1276_handle_radio_event(out_payload, capacity, out_length, out_metrics);
+        }
+        return ESP_ERR_TIMEOUT;
+    }
+
+    return sx1276_handle_radio_event(out_payload, capacity, out_length, out_metrics);
 }
 
 esp_err_t sx1276_poll_rx_packet(uint8_t *out_payload, size_t capacity, size_t *out_length, sx1276_rx_metrics_t *out_metrics, uint32_t timeout_ms)
@@ -1017,68 +1290,8 @@ esp_err_t sx1276_poll_rx_packet(uint8_t *out_payload, size_t capacity, size_t *o
             return ret;
         }
 
-        if ((irq_flags & SX1276_IRQ_RX_DONE_MASK) != 0U) {
-            /* Check PayloadCrcError (RAD-007) */
-            if ((irq_flags & SX1276_IRQ_PAYLOAD_CRC_ERROR_MASK) != 0U) {
-                (void)sx1276_clear_irq_flags(SX1276_IRQ_RX_DONE_MASK | SX1276_IRQ_PAYLOAD_CRC_ERROR_MASK);
-                return ESP_ERR_INVALID_CRC;
-            }
-
-            /* Read number of bytes received */
-            uint8_t nb_bytes = 0U;
-            ret = sx1276_read_register(SX1276_REG_RX_NB_BYTES, &nb_bytes);
-            if (ret != ESP_OK) {
-                (void)sx1276_clear_irq_flags(SX1276_IRQ_RX_DONE_MASK);
-                return ret;
-            }
-
-            if ((size_t)nb_bytes > capacity) {
-                ESP_LOGE(s_tag, "RX packet size (%u) exceeds buffer capacity (%zu)", nb_bytes, capacity);
-                (void)sx1276_clear_irq_flags(SX1276_IRQ_RX_DONE_MASK);
-                return ESP_ERR_INVALID_SIZE;
-            }
-
-            /* Read start address of last packet received */
-            uint8_t rx_current_addr = 0U;
-            ret = sx1276_read_register(SX1276_REG_FIFO_RX_CURRENT_ADDR, &rx_current_addr);
-            if (ret != ESP_OK) {
-                (void)sx1276_clear_irq_flags(SX1276_IRQ_RX_DONE_MASK);
-                return ret;
-            }
-
-            /* Set FIFO address pointer to start of received packet */
-            ret = sx1276_write_register(SX1276_REG_FIFO_ADDR_PTR, rx_current_addr);
-            if (ret != ESP_OK) {
-                (void)sx1276_clear_irq_flags(SX1276_IRQ_RX_DONE_MASK);
-                return ret;
-            }
-
-            /* Read payload bytes from FIFO */
-            if (nb_bytes > 0U) {
-                ret = sx1276_read_fifo(out_payload, (size_t)nb_bytes, capacity);
-                if (ret != ESP_OK) {
-                    (void)sx1276_clear_irq_flags(SX1276_IRQ_RX_DONE_MASK);
-                    return ret;
-                }
-            }
-
-            *out_length = (size_t)nb_bytes;
-
-            /* Read RSSI and SNR metrics */
-            if (out_metrics != NULL) {
-                ret = sx1276_read_packet_metrics(out_metrics);
-                if (ret != ESP_OK) {
-                    ESP_LOGW(s_tag, "Failed to read packet metrics (err: %s)", esp_err_to_name(ret));
-                }
-            }
-
-            /* Clear RxDone flag */
-            ret = sx1276_clear_irq_flags(SX1276_IRQ_RX_DONE_MASK);
-            if (ret != ESP_OK) {
-                return ret;
-            }
-
-            return ESP_OK;
+        if ((irq_flags & (SX1276_IRQ_RX_DONE_MASK | SX1276_IRQ_PAYLOAD_CRC_ERROR_MASK)) != 0U) {
+            return sx1276_handle_radio_event(out_payload, capacity, out_length, out_metrics);
         }
     }
 

@@ -18,7 +18,14 @@
 #define GATEWAY_RX_WINDOW_MS        (60000U)
 #define GATEWAY_RX_POLL_SLICE_MS    (1000U)
 
+#define RADIO_TASK_STACK_SIZE       (4096U)
+#define RADIO_TASK_PRIORITY         (5U)
+
 static const char *s_tag = "app_main";
+
+static StaticTask_t s_radio_task_tcb;
+static StackType_t s_radio_task_stack[RADIO_TASK_STACK_SIZE];
+static TaskHandle_t s_radio_task_handle = NULL;
 
 #if defined(CONFIG_APP_ROLE_GATEWAY_RX)
 static uint8_t s_rx_buf[256];
@@ -44,7 +51,7 @@ static void node_run_tx_task(void)
         esp_err_t ret = sx1276_send_packet(hello_payload, hello_len, NODE_TX_TIMEOUT_MS);
         if (ret == ESP_OK) {
             tx_success++;
-            ESP_LOGI(s_tag, "Node TX: Packet [%" PRIu32 "/%u] TX SUCCESS (TxDone confirmed)",
+            ESP_LOGI(s_tag, "Node TX: Packet [%" PRIu32 "/%u] TX SUCCESS (TxDone confirmed via DIO0)",
                      i, NODE_TX_TOTAL_PACKETS);
         } else {
             tx_fail++;
@@ -90,10 +97,10 @@ static void gateway_run_rx_task(void)
         sx1276_rx_metrics_t metrics;
         memset(&metrics, 0, sizeof(metrics));
 
-        ret = sx1276_poll_rx_packet(s_rx_buf, sizeof(s_rx_buf), &rx_len, &metrics, GATEWAY_RX_POLL_SLICE_MS);
+        ret = sx1276_receive_packet(s_rx_buf, sizeof(s_rx_buf), &rx_len, &metrics, GATEWAY_RX_POLL_SLICE_MS);
         if (ret == ESP_OK) {
             rx_packets++;
-            ESP_LOGI(s_tag, "Gateway RX: Packet [%" PRIu32 "] received! Length: %zu bytes", rx_packets, rx_len);
+            ESP_LOGI(s_tag, "Gateway RX: Packet [%" PRIu32 "] received via DIO0! Length: %zu bytes", rx_packets, rx_len);
             ESP_LOGI(s_tag, "Gateway RX: Payload: '%.*s'", (int)rx_len, (const char *)s_rx_buf);
 
             const int16_t snr_int = (int16_t)(metrics.snr_x100_db / 100);
@@ -105,9 +112,9 @@ static void gateway_run_rx_task(void)
             crc_errors++;
             ESP_LOGW(s_tag, "Gateway RX: Payload CRC error detected (count: %" PRIu32 ")! Discarded packet.", crc_errors);
         } else if (ret == ESP_ERR_TIMEOUT) {
-            /* 1s polling slice expired with no packet received; continue until total window ends */
+            /* 1s slice expired with no packet received; continue until total window ends */
         } else {
-            ESP_LOGE(s_tag, "Gateway RX: Poll error: %s", esp_err_to_name(ret));
+            ESP_LOGE(s_tag, "Gateway RX: Receive error: %s", esp_err_to_name(ret));
         }
     }
 
@@ -120,10 +127,51 @@ static void gateway_run_rx_task(void)
 }
 #endif
 
+/**
+ * @brief FreeRTOS Single Radio Owner Task entry point (RTOS-001, RTOS-002).
+ *
+ * @param[in] pvParameters Unused task parameters.
+ */
+static void app_run_radio_task(void *pvParameters)
+{
+    (void)pvParameters;
+    ESP_LOGI(s_tag, "Radio Owner Task running (priority: %u)", (unsigned int)RADIO_TASK_PRIORITY);
+
+    /* Initialize DIO0 interrupt for this Radio Owner Task (RTOS-009) */
+    esp_err_t ret = sx1276_init_dio0_isr(xTaskGetCurrentTaskHandle());
+    if (ret != ESP_OK) {
+        ESP_LOGE(s_tag, "Failed to initialize DIO0 ISR: %s", esp_err_to_name(ret));
+        vTaskDelete(NULL);
+        return;
+    }
+
+#if defined(CONFIG_APP_ROLE_NODE_TX)
+    ESP_LOGI(s_tag, "Dispatching role: Node TX (Event-Driven DIO0)");
+    node_run_tx_task();
+#elif defined(CONFIG_APP_ROLE_GATEWAY_RX)
+    ESP_LOGI(s_tag, "Dispatching role: Gateway RX (Event-Driven DIO0)");
+    gateway_run_rx_task();
+#else
+    ESP_LOGW(s_tag, "No active role selected in Kconfig");
+#endif
+
+    /* Stack high water mark check (RTOS-008) */
+    UBaseType_t stack_hwm = uxTaskGetStackHighWaterMark(NULL);
+    ESP_LOGI(s_tag, "Radio Task Stack High Water Mark: %u bytes remaining",
+             (unsigned int)(stack_hwm * sizeof(StackType_t)));
+
+    /* Cleanup ISR on role completion */
+    (void)sx1276_deinit_dio0_isr();
+    (void)sx1276_set_lora_standby_mode();
+
+    ESP_LOGI(s_tag, "Radio Owner Task finished. Deleting self.");
+    vTaskDelete(NULL);
+}
+
 void app_main(void)
 {
     ESP_LOGI(s_tag, "==================================================");
-    ESP_LOGI(s_tag, "  ESP32 + SX1276 Phase 3: LoRa TX/RX Polling");
+    ESP_LOGI(s_tag, "  ESP32 + SX1276 Phase 4: DIO0 Interrupt & FreeRTOS");
     ESP_LOGI(s_tag, "==================================================");
 
     /* Step 1: Initialize SPI bus (Phase 1 Baseline) */
@@ -189,14 +237,19 @@ void app_main(void)
 
     ESP_LOGI(s_tag, "Phase 1 and 2 Baselines verified successfully");
 
-    /* Step 6: Dispatch active role for Phase 3 */
-#if defined(CONFIG_APP_ROLE_NODE_TX)
-    ESP_LOGI(s_tag, "Dispatching role: Node TX");
-    node_run_tx_task();
-#elif defined(CONFIG_APP_ROLE_GATEWAY_RX)
-    ESP_LOGI(s_tag, "Dispatching role: Gateway RX");
-    gateway_run_rx_task();
-#else
-    ESP_LOGW(s_tag, "No active role selected or Ping-Pong not implemented in Phase 3");
-#endif
+    /* Step 6: Create and start FreeRTOS Radio Owner Task statically (MEM-001, RTOS-002) */
+    s_radio_task_handle = xTaskCreateStatic(
+        app_run_radio_task,
+        "radio_task",
+        RADIO_TASK_STACK_SIZE,
+        NULL,
+        RADIO_TASK_PRIORITY,
+        s_radio_task_stack,
+        &s_radio_task_tcb
+    );
+    if (s_radio_task_handle == NULL) {
+        ESP_LOGE(s_tag, "Failed to create Radio Owner Task statically");
+        return;
+    }
+    ESP_LOGI(s_tag, "Radio Owner Task created successfully (handle: %p)", (void *)s_radio_task_handle);
 }

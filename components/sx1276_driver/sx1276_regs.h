@@ -48,6 +48,8 @@ extern "C" {
 #define SX1276_REG_FIFO_RX_BYTE_ADDR            (0x25U)
 #define SX1276_REG_MODEM_CONFIG_3               (0x26U)
 #define SX1276_REG_SYNC_WORD                    (0x39U)
+#define SX1276_REG_DIO_MAPPING_1                (0x40U)
+#define SX1276_REG_DIO_MAPPING_2                (0x41U)
 #define SX1276_REG_VERSION                      (0x42U)
 #define SX1276_REG_PA_DAC                       (0x4DU)
 
@@ -123,6 +125,14 @@ extern "C" {
 /* RegModemConfig3 (0x26) bitfields */
 #define SX1276_MODEM_CONFIG_3_LOW_DATA_RATE_OPT_MASK (0x08U) /* Bit 3 */
 #define SX1276_MODEM_CONFIG_3_AGC_AUTO_ON_MASK       (0x04U) /* Bit 2 */
+
+/* RegDioMapping1 (0x40) bitfields */
+#define SX1276_DIO0_MAPPING_MASK                (0xC0U) /* Bits 7:6 */
+#define SX1276_DIO0_MAPPING_SHIFT               (6U)
+
+#define SX1276_DIO0_MAPPING_RX_DONE             (0x00U) /* 00b: RxDone in LoRa mode */
+#define SX1276_DIO0_MAPPING_TX_DONE             (0x01U) /* 01b: TxDone in LoRa mode */
+#define SX1276_DIO0_MAPPING_CAD_DONE            (0x02U) /* 10b: CadDone in LoRa mode */
 
 /* Expected RF Profile Constants for 915 MHz Baseline */
 #define SX1276_EXPECTED_REG_FRF_MSB             (0xE4U)
