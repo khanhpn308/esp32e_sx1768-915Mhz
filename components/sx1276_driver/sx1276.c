@@ -9,6 +9,7 @@
 #include "driver/spi_master.h"
 #include "esp_err.h"
 #include "esp_log.h"
+#include "esp_attr.h"
 
 #include "board_pins.h"
 #include "sx1276_regs.h"
@@ -16,11 +17,16 @@
 #define SX1276_STATE_TRANSITION_TIMEOUT_MS  (50U)
 #define SX1276_RETRY_INTERVAL_MS            (5U)
 #define SX1276_MAX_RETRIES                  (SX1276_STATE_TRANSITION_TIMEOUT_MS / SX1276_RETRY_INTERVAL_MS)
+#define SX1276_FIFO_MAX_TRANSFER_SIZE       (256U)
+#define SX1276_POLL_INTERVAL_MS             (10U)
 
 static const char *s_tag = "sx1276";
 static spi_device_handle_t s_spi_handle = NULL;
 static bool s_is_initialized = false;
 static sx1276_state_t s_current_state = SX1276_STATE_UNINIT;
+
+static DMA_ATTR uint8_t s_fifo_tx_buf[SX1276_FIFO_MAX_TRANSFER_SIZE];
+static DMA_ATTR uint8_t s_fifo_rx_buf[SX1276_FIFO_MAX_TRANSFER_SIZE];
 
 /**
  * @brief Internal helper to write RegOpMode and wait for status with bounded retries.
@@ -696,4 +702,385 @@ esp_err_t sx1276_verify_radio_config(const sx1276_config_t *config)
     ESP_LOGI(s_tag, "RF Config Read-back: PASS");
 
     return ESP_OK;
+}
+
+esp_err_t sx1276_set_lora_tx_mode(void)
+{
+    if (!s_is_initialized || s_spi_handle == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    esp_err_t ret = sx1276_write_register(SX1276_REG_OP_MODE, SX1276_MODE_LORA_TX);
+    if (ret != ESP_OK) {
+        ESP_LOGE(s_tag, "Failed to enter LoRa TX mode (err: %s)", esp_err_to_name(ret));
+        s_current_state = SX1276_STATE_FAULT;
+        return ret;
+    }
+
+    s_current_state = SX1276_STATE_TX;
+    return ESP_OK;
+}
+
+esp_err_t sx1276_set_lora_rx_continuous_mode(void)
+{
+    const uint8_t mask = SX1276_OP_MODE_LONGRANGEMODE_MASK | SX1276_OP_MODE_MASK;
+    const uint8_t expected = SX1276_MODE_LORA_RXCONTINUOUS;
+
+    esp_err_t ret = sx1276_transition_op_mode(SX1276_MODE_LORA_RXCONTINUOUS, mask, expected);
+    if (ret != ESP_OK) {
+        ESP_LOGE(s_tag, "Failed to enter LoRa RX Continuous mode (err: %s)", esp_err_to_name(ret));
+        return ret;
+    }
+
+    s_current_state = SX1276_STATE_RX_CONTINUOUS;
+    return ESP_OK;
+}
+
+esp_err_t sx1276_write_fifo(const uint8_t *data, size_t length)
+{
+    if (data == NULL || length == 0U || length > 255U) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (!s_is_initialized || s_spi_handle == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    const size_t total_len = 1U + length;
+    if (total_len > SX1276_FIFO_MAX_TRANSFER_SIZE) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    s_fifo_tx_buf[0] = (uint8_t)(SX1276_REG_FIFO | SX1276_SPI_WRITE_MASK);
+    memcpy(&s_fifo_tx_buf[1], data, length);
+
+    spi_transaction_t trans;
+    memset(&trans, 0, sizeof(trans));
+    trans.length = (size_t)(total_len * 8U);
+    trans.tx_buffer = s_fifo_tx_buf;
+    trans.rx_buffer = NULL;
+
+    esp_err_t ret = spi_device_transmit(s_spi_handle, &trans);
+    if (ret != ESP_OK) {
+        ESP_LOGE(s_tag, "SPI write FIFO failed (err: %s)", esp_err_to_name(ret));
+        return ret;
+    }
+
+    return ESP_OK;
+}
+
+esp_err_t sx1276_read_fifo(uint8_t *out_data, size_t length, size_t capacity)
+{
+    if (out_data == NULL || length == 0U || length > capacity || length > 255U) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (!s_is_initialized || s_spi_handle == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    const size_t total_len = 1U + length;
+    if (total_len > SX1276_FIFO_MAX_TRANSFER_SIZE) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    memset(s_fifo_tx_buf, 0, total_len);
+    s_fifo_tx_buf[0] = (uint8_t)(SX1276_REG_FIFO & SX1276_SPI_READ_MASK);
+
+    spi_transaction_t trans;
+    memset(&trans, 0, sizeof(trans));
+    trans.length = (size_t)(total_len * 8U);
+    trans.tx_buffer = s_fifo_tx_buf;
+    trans.rx_buffer = s_fifo_rx_buf;
+
+    esp_err_t ret = spi_device_transmit(s_spi_handle, &trans);
+    if (ret != ESP_OK) {
+        ESP_LOGE(s_tag, "SPI read FIFO failed (err: %s)", esp_err_to_name(ret));
+        return ret;
+    }
+
+    memcpy(out_data, &s_fifo_rx_buf[1], length);
+    return ESP_OK;
+}
+
+esp_err_t sx1276_read_irq_flags(uint8_t *out_flags)
+{
+    if (out_flags == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    return sx1276_read_register(SX1276_REG_IRQ_FLAGS, out_flags);
+}
+
+esp_err_t sx1276_clear_irq_flags(uint8_t flags_to_clear)
+{
+    return sx1276_write_register(SX1276_REG_IRQ_FLAGS, flags_to_clear);
+}
+
+esp_err_t sx1276_clear_all_irq_flags(void)
+{
+    return sx1276_write_register(SX1276_REG_IRQ_FLAGS, SX1276_IRQ_ALL_MASK);
+}
+
+esp_err_t sx1276_read_packet_metrics(sx1276_rx_metrics_t *out_metrics)
+{
+    if (out_metrics == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    uint8_t raw_snr_u8 = 0U;
+    esp_err_t ret = sx1276_read_register(SX1276_REG_PKT_SNR_VALUE, &raw_snr_u8);
+    if (ret != ESP_OK) {
+        ESP_LOGE(s_tag, "Failed to read RegPktSnrValue (err: %s)", esp_err_to_name(ret));
+        return ret;
+    }
+
+    uint8_t raw_rssi_u8 = 0U;
+    ret = sx1276_read_register(SX1276_REG_PKT_RSSI_VALUE, &raw_rssi_u8);
+    if (ret != ESP_OK) {
+        ESP_LOGE(s_tag, "Failed to read RegPktRssiValue (err: %s)", esp_err_to_name(ret));
+        return ret;
+    }
+
+    /* SX1276 Datasheet Section 5.5.5: SNR is signed two's complement, 0.25 dB per LSB */
+    const int8_t raw_snr = (int8_t)raw_snr_u8;
+    out_metrics->raw_snr = raw_snr;
+    out_metrics->raw_rssi = raw_rssi_u8;
+    out_metrics->snr_x100_db = (int16_t)((int16_t)raw_snr * 25);
+
+    /* HF port (915 MHz): RSSI = -157 + RegPktRssiValue */
+    int16_t rssi = (int16_t)(SX1276_RSSI_OFFSET_HF_DBM + (int16_t)raw_rssi_u8);
+    if (raw_snr < 0) {
+        /* When SNR < 0 dB: PacketRSSI(dBm) = -157 + PacketRssi + PacketSnr * 0.25 */
+        rssi = (int16_t)(rssi + (int16_t)(raw_snr / 4));
+    }
+    out_metrics->rssi_dbm = rssi;
+
+    return ESP_OK;
+}
+
+esp_err_t sx1276_send_packet(const uint8_t *payload, size_t length, uint32_t timeout_ms)
+{
+    if (payload == NULL || length == 0U || length > 255U) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (!s_is_initialized || s_spi_handle == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    /* Step 1: Put transceiver in Standby mode (RAD-012) */
+    esp_err_t ret = sx1276_set_lora_standby_mode();
+    if (ret != ESP_OK) {
+        ESP_LOGE(s_tag, "Failed to enter Standby mode for TX (err: %s)", esp_err_to_name(ret));
+        return ret;
+    }
+
+    /* Step 2: Clear stale IRQ flags */
+    ret = sx1276_clear_all_irq_flags();
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    /* Step 3: Read FIFO TX base address (RAD-008) */
+    uint8_t tx_base = 0U;
+    ret = sx1276_read_register(SX1276_REG_FIFO_TX_BASE_ADDR, &tx_base);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    /* Step 4: Set FIFO address pointer to TX base address */
+    ret = sx1276_write_register(SX1276_REG_FIFO_ADDR_PTR, tx_base);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    /* Step 5: Write payload into FIFO */
+    ret = sx1276_write_fifo(payload, length);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    /* Step 6: Write payload length */
+    ret = sx1276_write_register(SX1276_REG_PAYLOAD_LENGTH, (uint8_t)length);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    /* Step 7: Switch to TX mode (RegOpMode = 0x83) */
+    ret = sx1276_set_lora_tx_mode();
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    /* Step 8: Poll RegIrqFlags with bounded timeout (ERR-005, RTOS-007) */
+    const uint32_t poll_interval_ms = SX1276_POLL_INTERVAL_MS;
+    const uint32_t max_iterations = (timeout_ms + poll_interval_ms - 1U) / poll_interval_ms;
+    bool tx_done = false;
+
+    for (uint32_t iter = 0U; iter < max_iterations; iter++) {
+        vTaskDelay(pdMS_TO_TICKS(poll_interval_ms) + 1);
+
+        uint8_t irq_flags = 0U;
+        ret = sx1276_read_irq_flags(&irq_flags);
+        if (ret != ESP_OK) {
+            ESP_LOGE(s_tag, "Failed to read IRQ flags during TX poll (err: %s)", esp_err_to_name(ret));
+            (void)sx1276_set_lora_standby_mode();
+            return ret;
+        }
+
+        if ((irq_flags & SX1276_IRQ_TX_DONE_MASK) != 0U) {
+            tx_done = true;
+            break;
+        }
+    }
+
+    if (!tx_done) {
+        ESP_LOGE(s_tag, "TX timeout (%" PRIu32 " ms expired without TxDone)", timeout_ms);
+        (void)sx1276_set_lora_standby_mode();
+        return ESP_ERR_TIMEOUT;
+    }
+
+    /* Step 9: Clear TxDone flag (write-1-to-clear) */
+    ret = sx1276_clear_irq_flags(SX1276_IRQ_TX_DONE_MASK);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    /* Step 10: Switch radio back to Standby */
+    ret = sx1276_set_lora_standby_mode();
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    return ESP_OK;
+}
+
+esp_err_t sx1276_start_rx_continuous(void)
+{
+    if (!s_is_initialized || s_spi_handle == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    /* Step 1: Put radio in Standby */
+    esp_err_t ret = sx1276_set_lora_standby_mode();
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    /* Step 2: Configure RX FIFO base address to 0x00 */
+    ret = sx1276_write_register(SX1276_REG_FIFO_RX_BASE_ADDR, 0x00U);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    /* Step 3: Set FIFO address pointer to base address */
+    ret = sx1276_write_register(SX1276_REG_FIFO_ADDR_PTR, 0x00U);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    /* Step 4: Clear all previous IRQ flags */
+    ret = sx1276_clear_all_irq_flags();
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    /* Step 5: Enter RX_CONTINUOUS mode */
+    ret = sx1276_set_lora_rx_continuous_mode();
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    return ESP_OK;
+}
+
+esp_err_t sx1276_poll_rx_packet(uint8_t *out_payload, size_t capacity, size_t *out_length, sx1276_rx_metrics_t *out_metrics, uint32_t timeout_ms)
+{
+    if (out_payload == NULL || out_length == NULL || capacity == 0U) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (!s_is_initialized || s_spi_handle == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    const uint32_t poll_interval_ms = SX1276_POLL_INTERVAL_MS;
+    const uint32_t max_iterations = (timeout_ms + poll_interval_ms - 1U) / poll_interval_ms;
+
+    for (uint32_t iter = 0U; iter < max_iterations; iter++) {
+        vTaskDelay(pdMS_TO_TICKS(poll_interval_ms) + 1);
+
+        uint8_t irq_flags = 0U;
+        esp_err_t ret = sx1276_read_irq_flags(&irq_flags);
+        if (ret != ESP_OK) {
+            return ret;
+        }
+
+        if ((irq_flags & SX1276_IRQ_RX_DONE_MASK) != 0U) {
+            /* Check PayloadCrcError (RAD-007) */
+            if ((irq_flags & SX1276_IRQ_PAYLOAD_CRC_ERROR_MASK) != 0U) {
+                (void)sx1276_clear_irq_flags(SX1276_IRQ_RX_DONE_MASK | SX1276_IRQ_PAYLOAD_CRC_ERROR_MASK);
+                return ESP_ERR_INVALID_CRC;
+            }
+
+            /* Read number of bytes received */
+            uint8_t nb_bytes = 0U;
+            ret = sx1276_read_register(SX1276_REG_RX_NB_BYTES, &nb_bytes);
+            if (ret != ESP_OK) {
+                (void)sx1276_clear_irq_flags(SX1276_IRQ_RX_DONE_MASK);
+                return ret;
+            }
+
+            if ((size_t)nb_bytes > capacity) {
+                ESP_LOGE(s_tag, "RX packet size (%u) exceeds buffer capacity (%zu)", nb_bytes, capacity);
+                (void)sx1276_clear_irq_flags(SX1276_IRQ_RX_DONE_MASK);
+                return ESP_ERR_INVALID_SIZE;
+            }
+
+            /* Read start address of last packet received */
+            uint8_t rx_current_addr = 0U;
+            ret = sx1276_read_register(SX1276_REG_FIFO_RX_CURRENT_ADDR, &rx_current_addr);
+            if (ret != ESP_OK) {
+                (void)sx1276_clear_irq_flags(SX1276_IRQ_RX_DONE_MASK);
+                return ret;
+            }
+
+            /* Set FIFO address pointer to start of received packet */
+            ret = sx1276_write_register(SX1276_REG_FIFO_ADDR_PTR, rx_current_addr);
+            if (ret != ESP_OK) {
+                (void)sx1276_clear_irq_flags(SX1276_IRQ_RX_DONE_MASK);
+                return ret;
+            }
+
+            /* Read payload bytes from FIFO */
+            if (nb_bytes > 0U) {
+                ret = sx1276_read_fifo(out_payload, (size_t)nb_bytes, capacity);
+                if (ret != ESP_OK) {
+                    (void)sx1276_clear_irq_flags(SX1276_IRQ_RX_DONE_MASK);
+                    return ret;
+                }
+            }
+
+            *out_length = (size_t)nb_bytes;
+
+            /* Read RSSI and SNR metrics */
+            if (out_metrics != NULL) {
+                ret = sx1276_read_packet_metrics(out_metrics);
+                if (ret != ESP_OK) {
+                    ESP_LOGW(s_tag, "Failed to read packet metrics (err: %s)", esp_err_to_name(ret));
+                }
+            }
+
+            /* Clear RxDone flag */
+            ret = sx1276_clear_irq_flags(SX1276_IRQ_RX_DONE_MASK);
+            if (ret != ESP_OK) {
+                return ret;
+            }
+
+            return ESP_OK;
+        }
+    }
+
+    return ESP_ERR_TIMEOUT;
 }

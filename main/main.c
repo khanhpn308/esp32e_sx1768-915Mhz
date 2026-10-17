@@ -1,21 +1,132 @@
 #include <stdio.h>
+#include <string.h>
 #include <inttypes.h>
 
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "esp_err.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 
 #include "board_pins.h"
 #include "sx1276.h"
 
+#define NODE_TX_TOTAL_PACKETS       (10U)
+#define NODE_TX_INTERVAL_MS         (2000U)
+#define NODE_TX_TIMEOUT_MS          (3000U)
+
+#define GATEWAY_RX_WINDOW_MS        (60000U)
+#define GATEWAY_RX_POLL_SLICE_MS    (1000U)
+
 static const char *s_tag = "app_main";
+
+#if defined(CONFIG_APP_ROLE_GATEWAY_RX)
+static uint8_t s_rx_buf[256];
+#endif
+
+#if defined(CONFIG_APP_ROLE_NODE_TX)
+static void node_run_tx_task(void)
+{
+    const uint8_t hello_payload[] = "HELLO LORA";
+    const size_t hello_len = sizeof(hello_payload) - 1U;
+
+    ESP_LOGI(s_tag, "==================================================");
+    ESP_LOGI(s_tag, "  Node TX: Sending %u packets ('%.*s', %zu bytes)",
+             NODE_TX_TOTAL_PACKETS, (int)hello_len, (const char *)hello_payload, hello_len);
+    ESP_LOGI(s_tag, "==================================================");
+
+    uint32_t tx_success = 0U;
+    uint32_t tx_fail = 0U;
+
+    for (uint32_t i = 1U; i <= NODE_TX_TOTAL_PACKETS; i++) {
+        ESP_LOGI(s_tag, "Node TX: Sending packet [%" PRIu32 "/%u]...", i, NODE_TX_TOTAL_PACKETS);
+
+        esp_err_t ret = sx1276_send_packet(hello_payload, hello_len, NODE_TX_TIMEOUT_MS);
+        if (ret == ESP_OK) {
+            tx_success++;
+            ESP_LOGI(s_tag, "Node TX: Packet [%" PRIu32 "/%u] TX SUCCESS (TxDone confirmed)",
+                     i, NODE_TX_TOTAL_PACKETS);
+        } else {
+            tx_fail++;
+            ESP_LOGE(s_tag, "Node TX: Packet [%" PRIu32 "/%u] TX FAILED: %s",
+                     i, NODE_TX_TOTAL_PACKETS, esp_err_to_name(ret));
+        }
+
+        if (i < NODE_TX_TOTAL_PACKETS) {
+            vTaskDelay(pdMS_TO_TICKS(NODE_TX_INTERVAL_MS));
+        }
+    }
+
+    ESP_LOGI(s_tag, "==================================================");
+    ESP_LOGI(s_tag, "  Node TX Demo Complete: %" PRIu32 " succeeded, %" PRIu32 " failed",
+             tx_success, tx_fail);
+    ESP_LOGI(s_tag, "==================================================");
+}
+#endif
+
+#if defined(CONFIG_APP_ROLE_GATEWAY_RX)
+static void gateway_run_rx_task(void)
+{
+    ESP_LOGI(s_tag, "==================================================");
+    ESP_LOGI(s_tag, "  Gateway RX: Starting continuous receive mode");
+    ESP_LOGI(s_tag, "==================================================");
+
+    esp_err_t ret = sx1276_start_rx_continuous();
+    if (ret != ESP_OK) {
+        ESP_LOGE(s_tag, "Failed to start RX continuous: %s", esp_err_to_name(ret));
+        return;
+    }
+
+    ESP_LOGI(s_tag, "Gateway RX: Listening for incoming packets (%" PRIu32 " ms window)...",
+             (uint32_t)GATEWAY_RX_WINDOW_MS);
+
+    uint32_t rx_packets = 0U;
+    uint32_t crc_errors = 0U;
+    const int64_t start_time_us = esp_timer_get_time();
+    const int64_t window_us = (int64_t)GATEWAY_RX_WINDOW_MS * 1000LL;
+
+    while ((esp_timer_get_time() - start_time_us) < window_us) {
+        size_t rx_len = 0U;
+        sx1276_rx_metrics_t metrics;
+        memset(&metrics, 0, sizeof(metrics));
+
+        ret = sx1276_poll_rx_packet(s_rx_buf, sizeof(s_rx_buf), &rx_len, &metrics, GATEWAY_RX_POLL_SLICE_MS);
+        if (ret == ESP_OK) {
+            rx_packets++;
+            ESP_LOGI(s_tag, "Gateway RX: Packet [%" PRIu32 "] received! Length: %zu bytes", rx_packets, rx_len);
+            ESP_LOGI(s_tag, "Gateway RX: Payload: '%.*s'", (int)rx_len, (const char *)s_rx_buf);
+
+            const int16_t snr_int = (int16_t)(metrics.snr_x100_db / 100);
+            const int16_t snr_frac = (int16_t)(metrics.snr_x100_db % 100);
+            const uint16_t snr_frac_abs = (uint16_t)(snr_frac < 0 ? -snr_frac : snr_frac);
+            ESP_LOGI(s_tag, "Gateway RX: Metrics: RSSI = %d dBm (raw: 0x%02X), SNR = %d.%02u dB (raw: %d)",
+                     metrics.rssi_dbm, metrics.raw_rssi, snr_int, (unsigned int)snr_frac_abs, metrics.raw_snr);
+        } else if (ret == ESP_ERR_INVALID_CRC) {
+            crc_errors++;
+            ESP_LOGW(s_tag, "Gateway RX: Payload CRC error detected (count: %" PRIu32 ")! Discarded packet.", crc_errors);
+        } else if (ret == ESP_ERR_TIMEOUT) {
+            /* 1s polling slice expired with no packet received; continue until total window ends */
+        } else {
+            ESP_LOGE(s_tag, "Gateway RX: Poll error: %s", esp_err_to_name(ret));
+        }
+    }
+
+    (void)sx1276_set_lora_standby_mode();
+    ESP_LOGI(s_tag, "==================================================");
+    ESP_LOGI(s_tag, "  Gateway RX 60-Second Demo Window Completed");
+    ESP_LOGI(s_tag, "  Total Packets Received: %" PRIu32, rx_packets);
+    ESP_LOGI(s_tag, "  CRC Errors Discarded:   %" PRIu32, crc_errors);
+    ESP_LOGI(s_tag, "==================================================");
+}
+#endif
 
 void app_main(void)
 {
     ESP_LOGI(s_tag, "==================================================");
-    ESP_LOGI(s_tag, "  ESP32 + SX1276 Phase 2: RF Config (915 MHz)");
+    ESP_LOGI(s_tag, "  ESP32 + SX1276 Phase 3: LoRa TX/RX Polling");
     ESP_LOGI(s_tag, "==================================================");
 
-    /* Step 1: Initialize SPI bus */
+    /* Step 1: Initialize SPI bus (Phase 1 Baseline) */
     esp_err_t ret = board_init_spi_bus();
     if (ret != ESP_OK) {
         ESP_LOGE(s_tag, "SPI bus initialization failed: %s", esp_err_to_name(ret));
@@ -49,7 +160,7 @@ void app_main(void)
         return;
     }
 
-    /* Step 4: Configure RF parameters for 915 MHz baseline demo profile */
+    /* Step 4: Configure RF parameters for 915 MHz baseline demo profile (Phase 2 Baseline) */
     const sx1276_config_t rf_cfg = {
         .frequency_hz = 915000000U,
         .bandwidth = (uint8_t)SX1276_BW_125_KHZ,
@@ -76,5 +187,16 @@ void app_main(void)
         return;
     }
 
-    ESP_LOGI(s_tag, "Phase 2 RF Configuration verified successfully");
+    ESP_LOGI(s_tag, "Phase 1 and 2 Baselines verified successfully");
+
+    /* Step 6: Dispatch active role for Phase 3 */
+#if defined(CONFIG_APP_ROLE_NODE_TX)
+    ESP_LOGI(s_tag, "Dispatching role: Node TX");
+    node_run_tx_task();
+#elif defined(CONFIG_APP_ROLE_GATEWAY_RX)
+    ESP_LOGI(s_tag, "Dispatching role: Gateway RX");
+    gateway_run_rx_task();
+#else
+    ESP_LOGW(s_tag, "No active role selected or Ping-Pong not implemented in Phase 3");
+#endif
 }

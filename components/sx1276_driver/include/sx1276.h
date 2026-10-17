@@ -23,8 +23,20 @@ typedef enum {
     SX1276_STATE_UNINIT = 0,    /**< Driver uninitialized or deinitialized */
     SX1276_STATE_SLEEP,         /**< Radio in Sleep mode (FSK or LoRa) */
     SX1276_STATE_STANDBY,       /**< Radio in Standby mode */
+    SX1276_STATE_TX,            /**< Radio transmitting packet */
+    SX1276_STATE_RX_CONTINUOUS, /**< Radio listening for packets */
     SX1276_STATE_FAULT,         /**< Radio in fault state after timeout or communication failure */
 } sx1276_state_t;
+
+/**
+ * @brief Received packet signal quality metrics (RSSI and SNR).
+ */
+typedef struct {
+    int8_t raw_snr;             /**< Raw RegPktSnrValue (signed two's complement, 0.25 dB per LSB) */
+    uint8_t raw_rssi;           /**< Raw RegPktRssiValue */
+    int16_t snr_x100_db;        /**< Scaled SNR in 0.01 dB (e.g. +500 = +5.00 dB, -250 = -2.50 dB) */
+    int16_t rssi_dbm;           /**< Estimated packet RSSI in dBm */
+} sx1276_rx_metrics_t;
 
 /**
  * @brief Power amplifier output pin selection (RAD-010, DEC-04).
@@ -360,6 +372,203 @@ esp_err_t sx1276_configure_radio(const sx1276_config_t *config);
  *      - ESP_ERR_INVALID_RESPONSE: One or more registers failed verification
  */
 esp_err_t sx1276_verify_radio_config(const sx1276_config_t *config);
+
+/* --- Phase 3 TX/RX Polling and FIFO APIs --- */
+
+/**
+ * @brief Transition SX1276 to LoRa TX mode (RegOpMode = 0x83).
+ *
+ * Writes RegOpMode to start packet transmission.
+ *
+ * @note Context: Task context only. Device must have FIFO loaded with packet data.
+ *
+ * @return
+ *      - ESP_OK: Mode write succeeded
+ *      - ESP_ERR_INVALID_STATE: Driver not initialized
+ *      - Other esp_err_t codes from SPI communication
+ */
+esp_err_t sx1276_set_lora_tx_mode(void);
+
+/**
+ * @brief Transition SX1276 to LoRa Continuous Receive mode (RegOpMode = 0x85).
+ *
+ * Writes RegOpMode to start continuous packet reception and verifies transition.
+ *
+ * @note Context: Task context only.
+ *
+ * @return
+ *      - ESP_OK: Transition to RX continuous mode verified
+ *      - ESP_ERR_INVALID_STATE: Driver not initialized
+ *      - ESP_ERR_TIMEOUT: Transition timed out after bounded retries
+ *      - Other esp_err_t codes from SPI communication
+ */
+esp_err_t sx1276_set_lora_rx_continuous_mode(void);
+
+/**
+ * @brief Write data bytes into the SX1276 FIFO buffer via SPI burst write.
+ *
+ * Uses static DMA-aligned buffers to transmit 1 byte address (0x80) followed by data.
+ * The internal FIFO address pointer auto-increments with each byte written.
+ *
+ * @note Context: Task context only. Buffer ownership: caller retains ownership.
+ *
+ * @param[in] data Pointer to payload data buffer. Must not be NULL.
+ * @param[in] length Number of bytes to write (1 to 255).
+ *
+ * @return
+ *      - ESP_OK: Bytes written to FIFO successfully
+ *      - ESP_ERR_INVALID_ARG: data is NULL or length is 0 or > 255
+ *      - ESP_ERR_INVALID_STATE: Driver not initialized
+ *      - Other esp_err_t codes from SPI communication
+ */
+esp_err_t sx1276_write_fifo(const uint8_t *data, size_t length);
+
+/**
+ * @brief Read data bytes from the SX1276 FIFO buffer via SPI burst read.
+ *
+ * Uses static DMA-aligned buffers to transmit 1 byte address (0x00) and clock in data.
+ * The internal FIFO address pointer auto-increments with each byte read.
+ *
+ * @note Context: Task context only. Buffer ownership: written into caller buffer.
+ *
+ * @param[out] out_data Pointer to buffer to receive payload bytes. Must not be NULL.
+ * @param[in] length Number of bytes to read (1 to 255).
+ * @param[in] capacity Capacity of out_data buffer in bytes (must be >= length).
+ *
+ * @return
+ *      - ESP_OK: Bytes read from FIFO successfully
+ *      - ESP_ERR_INVALID_ARG: out_data is NULL, length is 0 or > capacity or > 255
+ *      - ESP_ERR_INVALID_STATE: Driver not initialized
+ *      - Other esp_err_t codes from SPI communication
+ */
+esp_err_t sx1276_read_fifo(uint8_t *out_data, size_t length, size_t capacity);
+
+/**
+ * @brief Read the RegIrqFlags (0x12) register.
+ *
+ * @note Context: Task context only.
+ *
+ * @param[out] out_flags Pointer to receive 8-bit IRQ flags value. Must not be NULL.
+ *
+ * @return
+ *      - ESP_OK: IRQ flags read successfully
+ *      - ESP_ERR_INVALID_ARG: out_flags is NULL
+ *      - ESP_ERR_INVALID_STATE: Driver not initialized
+ *      - Other esp_err_t codes from SPI communication
+ */
+esp_err_t sx1276_read_irq_flags(uint8_t *out_flags);
+
+/**
+ * @brief Clear specific IRQ flags in RegIrqFlags (0x12).
+ *
+ * SX1276 RegIrqFlags uses write-1-to-clear semantics.
+ *
+ * @note Context: Task context only.
+ *
+ * @param[in] flags_to_clear Bitmask of flags to clear (e.g. SX1276_IRQ_TX_DONE_MASK).
+ *
+ * @return
+ *      - ESP_OK: IRQ flags cleared successfully
+ *      - ESP_ERR_INVALID_STATE: Driver not initialized
+ *      - Other esp_err_t codes from SPI communication
+ */
+esp_err_t sx1276_clear_irq_flags(uint8_t flags_to_clear);
+
+/**
+ * @brief Clear all IRQ flags in RegIrqFlags (0x12) by writing 0xFF.
+ *
+ * @note Context: Task context only.
+ *
+ * @return
+ *      - ESP_OK: All IRQ flags cleared successfully
+ *      - ESP_ERR_INVALID_STATE: Driver not initialized
+ *      - Other esp_err_t codes from SPI communication
+ */
+esp_err_t sx1276_clear_all_irq_flags(void);
+
+/**
+ * @brief Read packet signal quality metrics (SNR and RSSI) from last received packet.
+ *
+ * Reads RegPktSnrValue (0x19) and RegPktRssiValue (0x1A), converts SNR from 2's complement
+ * (0.25 dB per LSB) and computes HF-band RSSI using Semtech SX1276 datasheet formula.
+ *
+ * @note Context: Task context only. Must be called after RxDone is confirmed.
+ *
+ * @param[out] out_metrics Pointer to sx1276_rx_metrics_t struct. Must not be NULL.
+ *
+ * @return
+ *      - ESP_OK: Metrics read and converted successfully
+ *      - ESP_ERR_INVALID_ARG: out_metrics is NULL
+ *      - ESP_ERR_INVALID_STATE: Driver not initialized
+ *      - Other esp_err_t codes from SPI communication
+ */
+esp_err_t sx1276_read_packet_metrics(sx1276_rx_metrics_t *out_metrics);
+
+/**
+ * @brief Transmit a raw payload and poll RegIrqFlags until TxDone or timeout.
+ *
+ * Sets Standby mode, resets FIFO pointer to TX base address, writes payload,
+ * sets RegPayloadLength, enters TX mode, and polls RegIrqFlags every 10 ms
+ * (yielding CPU with vTaskDelay) until TxDone is confirmed or timeout expires.
+ * On completion, clears TxDone and returns transceiver to Standby mode.
+ *
+ * @note Context: Task context only.
+ *
+ * @param[in] payload Pointer to byte buffer to transmit. Must not be NULL.
+ * @param[in] length Number of bytes to transmit (1 to 255).
+ * @param[in] timeout_ms Maximum time to wait for TxDone in milliseconds.
+ *
+ * @return
+ *      - ESP_OK: Packet transmitted successfully and TxDone confirmed
+ *      - ESP_ERR_INVALID_ARG: payload is NULL or length is 0 or > 255
+ *      - ESP_ERR_INVALID_STATE: Driver not initialized
+ *      - ESP_ERR_TIMEOUT: Timeout expired before TxDone was asserted
+ *      - Other esp_err_t codes from SPI communication
+ */
+esp_err_t sx1276_send_packet(const uint8_t *payload, size_t length, uint32_t timeout_ms);
+
+/**
+ * @brief Initialize continuous receive mode on SX1276.
+ *
+ * Sets Standby mode, configures RegFifoRxBaseAddr to 0x00, points RegFifoAddrPtr to 0x00,
+ * clears all previous IRQ flags, and enters RX_CONTINUOUS mode.
+ *
+ * @note Context: Task context only.
+ *
+ * @return
+ *      - ESP_OK: Continuous RX mode started successfully
+ *      - ESP_ERR_INVALID_STATE: Driver not initialized
+ *      - Other esp_err_t codes from SPI communication
+ */
+esp_err_t sx1276_start_rx_continuous(void);
+
+/**
+ * @brief Poll RegIrqFlags for an incoming packet in continuous receive mode.
+ *
+ * Polls RegIrqFlags every 10 ms (yielding CPU with vTaskDelay) up to timeout_ms.
+ * When RxDone is detected:
+ * - Checks PayloadCrcError: if corrupted, clears flags and returns ESP_ERR_INVALID_CRC.
+ * - If valid: reads RegRxNbBytes, points RegFifoAddrPtr to RegFifoRxCurrentAddr,
+ *   reads payload into out_payload, reads RSSI/SNR metrics, and clears RxDone.
+ *
+ * @note Context: Task context only.
+ *
+ * @param[out] out_payload Buffer to receive packet payload. Must not be NULL.
+ * @param[in] capacity Maximum capacity of out_payload buffer in bytes.
+ * @param[out] out_length Pointer to receive actual number of bytes read. Must not be NULL.
+ * @param[out] out_metrics Pointer to receive packet signal metrics (can be NULL if not needed).
+ * @param[in] timeout_ms Maximum time to wait for a packet in milliseconds.
+ *
+ * @return
+ *      - ESP_OK: Packet received and validated successfully
+ *      - ESP_ERR_INVALID_ARG: out_payload or out_length is NULL, or capacity is 0
+ *      - ESP_ERR_INVALID_STATE: Driver not initialized
+ *      - ESP_ERR_TIMEOUT: Timeout expired with no packet received
+ *      - ESP_ERR_INVALID_CRC: Packet received but PayloadCrcError was asserted
+ *      - ESP_ERR_INVALID_SIZE: Packet length exceeds buffer capacity
+ *      - Other esp_err_t codes from SPI communication
+ */
+esp_err_t sx1276_poll_rx_packet(uint8_t *out_payload, size_t capacity, size_t *out_length, sx1276_rx_metrics_t *out_metrics, uint32_t timeout_ms);
 
 #ifdef __cplusplus
 }

@@ -34,6 +34,9 @@ extern "C" {
 #define SX1276_REG_FIFO_RX_CURRENT_ADDR         (0x10U)
 #define SX1276_REG_IRQ_FLAGS_MASK               (0x11U)
 #define SX1276_REG_IRQ_FLAGS                    (0x12U)
+#define SX1276_REG_RX_NB_BYTES                  (0x13U)
+#define SX1276_REG_PKT_SNR_VALUE                (0x19U)
+#define SX1276_REG_PKT_RSSI_VALUE               (0x1AU)
 #define SX1276_REG_MODEM_CONFIG_1               (0x1DU)
 #define SX1276_REG_MODEM_CONFIG_2               (0x1EU)
 #define SX1276_REG_SYMB_TIMEOUT_LSB             (0x1FU)
@@ -74,6 +77,24 @@ extern "C" {
 #define SX1276_MODE_FSK_STDBY                   (SX1276_OP_MODE_FSK | SX1276_MODE_STDBY)
 #define SX1276_MODE_LORA_SLEEP                  (SX1276_OP_MODE_LORA | SX1276_MODE_SLEEP)
 #define SX1276_MODE_LORA_STDBY                  (SX1276_OP_MODE_LORA | SX1276_MODE_STDBY)
+#define SX1276_MODE_LORA_TX                     (SX1276_OP_MODE_LORA | SX1276_MODE_TX)
+#define SX1276_MODE_LORA_RXCONTINUOUS           (SX1276_OP_MODE_LORA | SX1276_MODE_RXCONTINUOUS)
+
+/* RegIrqFlags (0x12) bitmasks (write-1-to-clear) */
+#define SX1276_IRQ_RX_TIMEOUT_MASK              (0x80U) /* Bit 7: Timeout */
+#define SX1276_IRQ_RX_DONE_MASK                 (0x40U) /* Bit 6: Packet reception complete */
+#define SX1276_IRQ_PAYLOAD_CRC_ERROR_MASK       (0x20U) /* Bit 5: Payload CRC error */
+#define SX1276_IRQ_VALID_HEADER_MASK            (0x10U) /* Bit 4: Valid header received */
+#define SX1276_IRQ_TX_DONE_MASK                 (0x08U) /* Bit 3: FIFO payload transmission complete */
+#define SX1276_IRQ_CAD_DONE_MASK                (0x04U) /* Bit 2: CAD complete */
+#define SX1276_IRQ_FHSS_CHANGE_CHANNEL_MASK     (0x02U) /* Bit 1: FHSS change channel */
+#define SX1276_IRQ_CAD_DETECTED_MASK            (0x01U) /* Bit 0: Valid LoRa signal detected */
+#define SX1276_IRQ_ALL_MASK                     (0xFFU) /* All IRQ flags */
+
+/* SX1276 RSSI Offset constants for HF/LF bands (Datasheet section 5.5.5) */
+#define SX1276_RSSI_OFFSET_HF_DBM               (-157)
+#define SX1276_RSSI_OFFSET_LF_DBM               (-164)
+
 
 /* RegPaConfig (0x09) bitfields */
 #define SX1276_PA_CONFIG_PA_SELECT_MASK         (0x80U) /* Bit 7: 1 = PA_BOOST, 0 = RFO */

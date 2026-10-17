@@ -2,7 +2,7 @@ menu "Application Role Configuration"
 
     choice APP_ROLE
         prompt "Device Operating Role"
-        default APP_ROLE_PING_PONG
+        default APP_ROLE_NODE_TX
         help
             Select the operational role for this firmware build.
             - Node TX: Periodic telemetry transmitter
