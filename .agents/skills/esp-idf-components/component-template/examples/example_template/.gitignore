@@ -1,8 +1,0 @@
-# Generated ESP-IDF state
-build/
-sdkconfig
-sdkconfig.old
-
-# This template uses a local path dependency, so its generated lock file
-# contains a machine-specific absolute path.
-dependencies.lock
