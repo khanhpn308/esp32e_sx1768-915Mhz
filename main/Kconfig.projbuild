@@ -2,7 +2,7 @@ menu "Application Role Configuration"
 
     choice APP_ROLE
         prompt "Device Operating Role"
-        default APP_ROLE_PING_PONG
+        default APP_ROLE_NODE_TX
         help
             Select the operational role for this firmware build.
             - Node TX: Periodic telemetry transmitter
@@ -19,5 +19,26 @@ menu "Application Role Configuration"
             bool "Ping-Pong (Bidirectional P2P Test)"
 
     endchoice
+
+    if APP_ROLE_PING_PONG
+
+        choice APP_PING_PONG_MODE
+            prompt "Ping-Pong Operating Mode"
+            default APP_PING_PONG_MODE_INITIATOR
+            help
+                Select whether this device operates as the Ping-Pong Initiator (Node)
+                or Responder (Gateway).
+                - Initiator: Sends PING frames, waits for PONG, measures RTT.
+                - Responder: Listens for PING frames, responds with matching PONG frames.
+
+            config APP_PING_PONG_MODE_INITIATOR
+                bool "Initiator (Node: Sends PING, measures RTT)"
+
+            config APP_PING_PONG_MODE_RESPONDER
+                bool "Responder (Gateway: Listens, responds with PONG)"
+
+        endchoice
+
+    endif
 
 endmenu

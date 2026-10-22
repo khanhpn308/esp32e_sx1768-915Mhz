@@ -1,9 +1,8 @@
 # Local AI agent configuration
 /.agents/
 
-*/C_CODING_STANDARDS.md
-*/SUBAGET_AUDITOR_PROMPT.md
-/AGENTS.md
+
+
 # Local skills lockfile
 /skills-lock.json
 
